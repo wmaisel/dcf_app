@@ -1,4 +1,5 @@
 import logging
+import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +9,10 @@ import math
 import re
 from statistics import mean
 from typing import Optional, List, Dict, Any
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .cost_of_capital import (
     NORMALIZED_MARKET_PREMIUM,
@@ -23,12 +28,50 @@ from .dcf_engine_v2 import run_dcf_v2, DCFComputationError, ScenarioPreset
 
 logger = logging.getLogger(__name__)
 
+
+def _build_yf_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_YF_SESSION = _build_yf_session()
+
+
+def _get_yf_ticker(ticker: str) -> yf.Ticker:
+    return yf.Ticker(ticker, session=_YF_SESSION)
+
+
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174,https://wmaisel.github.io",
+)
+
+
+def _parse_origins(raw: str) -> List[str]:
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
 app = FastAPI()
+
 
 @app.get("/debug/yf/{ticker}")
 def debug_yf(ticker: str):
-    import yfinance as yf
-    tk = yf.Ticker(ticker)
+    tk = _get_yf_ticker(ticker)
     f = tk.financials
     c = tk.cashflow
     b = tk.balance_sheet
@@ -50,15 +93,8 @@ def _clamp(value: float, lower: float, upper: float) -> float:
         return lower
     return max(lower, min(value, upper))
 
-app = FastAPI()
-
-# Allow your Vite frontend to call this API
-origins = [
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-]
+# Allow your Vite frontend (local + GitHub Pages) to call this API
+origins = _parse_origins(ALLOWED_ORIGINS)
 
 app.add_middleware(
     CORSMiddleware,
@@ -472,7 +508,7 @@ async def root():
 @app.get("/api/company/{ticker}")
 async def get_company(request: Request, ticker: str):
     try:
-        tk = yf.Ticker(ticker)
+        tk = _get_yf_ticker(ticker)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ticker")
 
@@ -480,8 +516,18 @@ async def get_company(request: Request, ticker: str):
     cashflow = tk.cashflow
     balance = tk.balance_sheet
 
-    if financials is None or financials.empty:
-        raise HTTPException(status_code=404, detail="No financial data found for this ticker.")
+    missing_sections = []
+    for name, frame in (
+        ("financials", financials),
+        ("cashflow", cashflow),
+        ("balance_sheet", balance),
+    ):
+        if frame is None or frame.empty:
+            missing_sections.append(name)
+
+    if missing_sections:
+        logger.warning("Ticker %s missing sections: %s", ticker, ",".join(missing_sections))
+        raise HTTPException(status_code=502, detail="Upstream data unavailable. Please retry later.")
 
     revenue_series = get_row(financials, "Total Revenue")
     ebit_series = get_ebit_series(financials)
