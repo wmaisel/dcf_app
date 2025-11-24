@@ -23,6 +23,8 @@ from .dcf_engine_v2 import run_dcf_v2, DCFComputationError, ScenarioPreset
 
 logger = logging.getLogger(__name__)
 
+app = FastAPI()
+
 @app.get("/debug/yf/{ticker}")
 def debug_yf(ticker: str):
     import yfinance as yf
