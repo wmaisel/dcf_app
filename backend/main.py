@@ -23,6 +23,21 @@ from .dcf_engine_v2 import run_dcf_v2, DCFComputationError, ScenarioPreset
 
 logger = logging.getLogger(__name__)
 
+@app.get("/debug/yf/{ticker}")
+def debug_yf(ticker: str):
+    import yfinance as yf
+    tk = yf.Ticker(ticker)
+    f = tk.financials
+    c = tk.cashflow
+    b = tk.balance_sheet
+    return {
+        "ticker": ticker,
+        "financials_empty": f is None or f.empty,
+        "cashflow_empty": c is None or c.empty,
+        "balance_sheet_empty": b is None or b.empty,
+        "financials_rows": None if f is None else list(f.index[:5]),
+        "cashflow_rows": None if c is None else list(c.index[:5]),
+    }
 
 def _is_finite_number(value: Optional[float]) -> bool:
     return value is not None and isinstance(value, (int, float)) and math.isfinite(value)
