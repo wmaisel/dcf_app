@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-yfinance
-pandas
-numpy
 scipy
+numpy==2.0.2
+pandas==2.3.3
+yfinance==0.2.66
