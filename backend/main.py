@@ -53,7 +53,15 @@ _YF_SESSION = _build_yf_session()
 
 
 def _get_yf_ticker(ticker: str) -> yf.Ticker:
-    return yf.Ticker(ticker, session=_YF_SESSION)
+    """
+    Prefer our hardened session but fall back to yfinance defaults when Yahoo
+    rejects custom clients (the curl_cffi requirement introduced in late 2024).
+    """
+    try:
+        return yf.Ticker(ticker, session=_YF_SESSION)
+    except Exception as exc:
+        logger.warning("Custom session rejected for %s: %s; falling back to default session", ticker, exc)
+        return yf.Ticker(ticker)
 
 
 ALLOWED_ORIGINS = os.environ.get(
