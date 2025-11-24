@@ -6,6 +6,6 @@ export default defineConfig({
   plugins: [react()],
   base: '/dcf_app/',
   build: {
-    outDir: 'docs',            
+    outDir: 'dist',            
   },
 })
