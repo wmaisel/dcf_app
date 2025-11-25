@@ -163,16 +163,36 @@ def _normalize_statement_label(label: str) -> str:
     return label.strip()
 
 
-def _fetch_financials_via_quote_summary(ticker: str) -> Dict[str, pd.DataFrame]:
-    session = _get_quote_summary_session()
-    url = _QUOTE_SUMMARY_URL.format(ticker=ticker)
-    try:
-        response = session.get(url, params={"modules": _QUOTE_SUMMARY_MODULES}, timeout=15)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:  # pragma: no cover - network
-        logger.warning("Quote summary fallback failed for %s: %s", ticker, exc)
-        return {}
+def _fetch_financials_via_quote_summary(ticker: str, ticker_obj: Optional[yf.Ticker] = None) -> Dict[str, pd.DataFrame]:
+    params = {
+        "modules": _QUOTE_SUMMARY_MODULES,
+        "lang": "en-US",
+        "region": "US",
+    }
+    payload = None
+    if ticker_obj is not None:
+        try:
+            payload = ticker_obj._data.get_raw_json(
+                _QUOTE_SUMMARY_URL.format(ticker=ticker),
+                params=params,
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Quote summary fallback via yfinance session failed for %s: %s",
+                ticker,
+                exc,
+            )
+    if payload is None:
+        session = _get_quote_summary_session()
+        url = _QUOTE_SUMMARY_URL.format(ticker=ticker)
+        try:
+            response = session.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:  # pragma: no cover - network
+            logger.warning("Quote summary fallback failed for %s: %s", ticker, exc)
+            return {}
     result = payload.get("quoteSummary", {}).get("result")
     if not result:
         return {}
@@ -657,7 +677,7 @@ async def get_company(request: Request, ticker: str):
             missing_sections.append(name)
 
     if missing_sections:
-        fallback_frames = _fetch_financials_via_quote_summary(ticker)
+        fallback_frames = _fetch_financials_via_quote_summary(ticker, tk)
         if fallback_frames:
             if (financials is None or financials.empty) and not fallback_frames["financials"].empty:
                 financials = fallback_frames["financials"]
