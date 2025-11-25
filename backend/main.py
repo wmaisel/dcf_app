@@ -1,18 +1,23 @@
 import logging
 import os
+import re
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import pandas as pd
 import math
-import re
 from statistics import mean
 from typing import Optional, List, Dict, Any
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:
+    from curl_cffi import requests as curl_requests
+except Exception:  # pragma: no cover - optional dependency
+    curl_requests = None
 
 from .cost_of_capital import (
     NORMALIZED_MARKET_PREMIUM,
@@ -62,6 +67,124 @@ def _get_yf_ticker(ticker: str) -> yf.Ticker:
     except Exception as exc:
         logger.warning("Custom session rejected for %s: %s; falling back to default session", ticker, exc)
         return yf.Ticker(ticker)
+
+
+_QUOTE_SUMMARY_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_QUOTE_SUMMARY_MODULES = ",".join(
+    [
+        "incomeStatementHistory",
+        "incomeStatementHistoryQuarterly",
+        "balanceSheetHistory",
+        "balanceSheetHistoryQuarterly",
+        "cashflowStatementHistory",
+        "cashflowStatementHistoryQuarterly",
+    ]
+)
+_QUOTE_SUMMARY_URL = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+_QUOTE_SUMMARY_SESSION = None
+
+
+def _get_quote_summary_session():
+    global _QUOTE_SUMMARY_SESSION
+    if _QUOTE_SUMMARY_SESSION is not None:
+        return _QUOTE_SUMMARY_SESSION
+    if curl_requests is not None:
+        session = curl_requests.Session()
+    else:  # pragma: no cover - curl_cffi should be available via yfinance, but keep fallback
+        session = requests.Session()
+        adapter = HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.3))
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    session.headers.update(_QUOTE_SUMMARY_HEADERS)
+    _QUOTE_SUMMARY_SESSION = session
+    return session
+
+
+def _quote_summary_history_to_df(history: Optional[List[Dict[str, Any]]]) -> pd.DataFrame:
+    if not history:
+        return pd.DataFrame()
+    rows: Dict[str, Dict[pd.Timestamp, float]] = {}
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        end_date = entry.get("endDate")
+        timestamp = None
+        if isinstance(end_date, dict):
+            timestamp = end_date.get("raw") or end_date.get("fmt")
+        elif isinstance(end_date, (int, float, str)):
+            timestamp = end_date
+        if timestamp is None:
+            continue
+        try:
+            col = pd.to_datetime(timestamp, unit="s", utc=True)
+        except Exception:
+            try:
+                col = pd.to_datetime(timestamp, utc=True)
+            except Exception:
+                continue
+        for key, value in entry.items():
+            if key == "endDate":
+                continue
+            raw_value = None
+            if isinstance(value, dict):
+                raw_value = value.get("raw")
+            elif isinstance(value, (int, float)):
+                raw_value = value
+            if raw_value is None:
+                continue
+            rows.setdefault(key, {})[col] = raw_value
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    df = df[sorted(df.columns, reverse=True)]
+    df.index = [_normalize_statement_label(idx) for idx in df.index]
+    return df
+
+
+def _normalize_statement_label(label: str) -> str:
+    if not label:
+        return label
+    label = str(label)
+    label = re.sub(r"([a-z])([A-Z])", r"\1 \2", label)
+    label = label.replace("_", " ")
+    label = label.title()
+    replacements = {
+        "Ebit": "EBIT",
+        "Ebitda": "EBITDA",
+        "Eps": "EPS",
+        "Ii": "II",
+    }
+    for src, dest in replacements.items():
+        label = label.replace(src, dest)
+    return label.strip()
+
+
+def _fetch_financials_via_quote_summary(ticker: str) -> Dict[str, pd.DataFrame]:
+    session = _get_quote_summary_session()
+    url = _QUOTE_SUMMARY_URL.format(ticker=ticker)
+    try:
+        response = session.get(url, params={"modules": _QUOTE_SUMMARY_MODULES}, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # pragma: no cover - network
+        logger.warning("Quote summary fallback failed for %s: %s", ticker, exc)
+        return {}
+    result = payload.get("quoteSummary", {}).get("result")
+    if not result:
+        return {}
+    node = result[0]
+    income_history = node.get("incomeStatementHistory", {}).get("incomeStatementHistory")
+    balance_history = node.get("balanceSheetHistory", {}).get("balanceSheetStatements")
+    cash_history = node.get("cashflowStatementHistory", {}).get("cashflowStatements")
+    return {
+        "financials": _quote_summary_history_to_df(income_history),
+        "balance": _quote_summary_history_to_df(balance_history),
+        "cashflow": _quote_summary_history_to_df(cash_history),
+    }
 
 
 ALLOWED_ORIGINS = os.environ.get(
@@ -534,7 +657,25 @@ async def get_company(request: Request, ticker: str):
             missing_sections.append(name)
 
     if missing_sections:
-        logger.warning("Ticker %s missing sections: %s", ticker, ",".join(missing_sections))
+        fallback_frames = _fetch_financials_via_quote_summary(ticker)
+        if fallback_frames:
+            if (financials is None or financials.empty) and not fallback_frames["financials"].empty:
+                financials = fallback_frames["financials"]
+            if (cashflow is None or cashflow.empty) and not fallback_frames["cashflow"].empty:
+                cashflow = fallback_frames["cashflow"]
+            if (balance is None or balance.empty) and not fallback_frames["balance"].empty:
+                balance = fallback_frames["balance"]
+        missing_sections = []
+        for name, frame in (
+            ("financials", financials),
+            ("cashflow", cashflow),
+            ("balance_sheet", balance),
+        ):
+            if frame is None or frame.empty:
+                missing_sections.append(name)
+
+    if missing_sections:
+        logger.warning("Ticker %s missing sections after fallback: %s", ticker, ",".join(missing_sections))
         raise HTTPException(status_code=502, detail="Upstream data unavailable. Please retry later.")
 
     revenue_series = get_row(financials, "Total Revenue")
