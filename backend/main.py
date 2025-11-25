@@ -34,23 +34,27 @@ from .dcf_engine_v2 import run_dcf_v2, DCFComputationError, ScenarioPreset
 logger = logging.getLogger(__name__)
 
 
-def _build_yf_session() -> requests.Session:
-    session = requests.Session()
+def _build_yf_session():
+    # Use curl_cffi by default because Yahoo now requires it. Only fall back to
+    # requests.Session when curl_cffi isn't available (tests, minimal envs).
+    session_cls = curl_requests.Session if curl_requests is not None else requests.Session
+    session = session_cls()
     session.headers.update(
         {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         }
     )
-    retry = Retry(
-        total=3,
-        backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "POST"]),
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+    if session_cls is requests.Session:
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET", "POST"]),
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
     return session
 
 
