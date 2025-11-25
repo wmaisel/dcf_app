@@ -84,7 +84,7 @@ _QUOTE_SUMMARY_MODULES = ",".join(
         "cashflowStatementHistoryQuarterly",
     ]
 )
-_QUOTE_SUMMARY_URL = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+_QUOTE_SUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
 _QUOTE_SUMMARY_SESSION = None
 
 
