@@ -1,7 +1,6 @@
 import logging
 import os
 import re
-import time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +8,7 @@ import yfinance as yf
 import pandas as pd
 import math
 from statistics import mean
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -33,9 +32,6 @@ from .cost_of_capital import (
 from .dcf_engine_v2 import run_dcf_v2, DCFComputationError, ScenarioPreset
 
 logger = logging.getLogger(__name__)
-
-_CACHE_TTL_SECONDS = int(os.environ.get("FUNDAMENTALS_CACHE_TTL", "900"))
-_FUNDAMENTALS_CACHE: Dict[str, Tuple[float, Dict[str, Optional[pd.DataFrame]]]] = {}
 
 
 def _build_yf_session() -> requests.Session:
@@ -167,85 +163,6 @@ def _normalize_statement_label(label: str) -> str:
     return label.strip()
 
 
-def _get_cached_statements(ticker: str) -> Optional[Dict[str, Optional[pd.DataFrame]]]:
-    if not _cache_enabled():
-        return None
-    ticker_key = ticker.upper()
-    entry = _FUNDAMENTALS_CACHE.get(ticker_key)
-    if not entry:
-        return None
-    timestamp, frames = entry
-    if time.time() - timestamp > _CACHE_TTL_SECONDS:
-        try:
-            del _FUNDAMENTALS_CACHE[ticker_key]
-        except KeyError:
-            pass
-        return None
-    return frames
-
-
-def _cache_statements(
-    ticker: str,
-    financials: Optional[pd.DataFrame],
-    cashflow: Optional[pd.DataFrame],
-    balance: Optional[pd.DataFrame],
-) -> None:
-    if not _cache_enabled():
-        return
-    ticker_key = ticker.upper()
-    try:
-        _FUNDAMENTALS_CACHE[ticker_key] = (
-            time.time(),
-            {
-                "financials": None if financials is None else financials.copy(deep=True),
-                "cashflow": None if cashflow is None else cashflow.copy(deep=True),
-                "balance": None if balance is None else balance.copy(deep=True),
-            },
-        )
-    except Exception:
-        logger.debug("Unable to cache statements for %s", ticker)
-
-
-def _cache_enabled() -> bool:
-    if _CACHE_TTL_SECONDS <= 0:
-        return False
-    if os.environ.get("ENABLE_FUNDAMENTALS_CACHE", "1") == "0":
-        return False
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        return False
-    return True
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    for token in ("too many requests", "rate limit", "429", "unavailable"):
-        if token in text:
-            return True
-    response = getattr(exc, "response", None)
-    if response is not None:
-        status = getattr(response, "status_code", None)
-        if status in (401, 429, 503):
-            return True
-    return False
-
-
-def _attempt_quote_summary_fetch(fetch_fn, ticker: str, label: str) -> Optional[Dict[str, Any]]:
-    for attempt in range(3):
-        try:
-            payload = fetch_fn()
-            if payload:
-                return payload
-            return None
-        except Exception as exc:
-            rate_limited = _is_rate_limit_error(exc)
-            logger.warning("%s failed for %s (attempt %d): %s", label, ticker, attempt + 1, exc)
-            if rate_limited and attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            break
-    return None
-
-
 def _fetch_financials_via_quote_summary(ticker: str, ticker_obj: Optional[yf.Ticker] = None) -> Dict[str, pd.DataFrame]:
     params = {
         "modules": _QUOTE_SUMMARY_MODULES,
@@ -253,25 +170,28 @@ def _fetch_financials_via_quote_summary(ticker: str, ticker_obj: Optional[yf.Tic
         "region": "US",
     }
     payload = None
-    url = _QUOTE_SUMMARY_URL.format(ticker=ticker)
     if ticker_obj is not None:
-        payload = _attempt_quote_summary_fetch(
-            lambda: ticker_obj._data.get_raw_json(url, params=params, timeout=15),
-            ticker,
-            "Quote summary fallback via yfinance session",
-        )
+        try:
+            payload = ticker_obj._data.get_raw_json(
+                _QUOTE_SUMMARY_URL.format(ticker=ticker),
+                params=params,
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Quote summary fallback via yfinance session failed for %s: %s",
+                ticker,
+                exc,
+            )
     if payload is None:
         session = _get_quote_summary_session()
-        def _remote_fetch():
+        url = _QUOTE_SUMMARY_URL.format(ticker=ticker)
+        try:
             response = session.get(url, params=params, timeout=15)
             response.raise_for_status()
-            return response.json()
-        payload = _attempt_quote_summary_fetch(
-            _remote_fetch,
-            ticker,
-            "Quote summary fallback",
-        )
-        if payload is None:
+            payload = response.json()
+        except Exception as exc:  # pragma: no cover - network
+            logger.warning("Quote summary fallback failed for %s: %s", ticker, exc)
             return {}
     result = payload.get("quoteSummary", {}).get("result")
     if not result:
@@ -738,25 +658,14 @@ async def root():
 
 @app.get("/api/company/{ticker}")
 async def get_company(request: Request, ticker: str):
-    ticker_clean = ticker.upper()
-    cached_frames = _get_cached_statements(ticker_clean)
-    financials = cashflow = balance = None
-    if cached_frames:
-        financials = cached_frames.get("financials")
-        cashflow = cached_frames.get("cashflow")
-        balance = cached_frames.get("balance")
-
     try:
-        tk = _get_yf_ticker(ticker_clean)
+        tk = _get_yf_ticker(ticker)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ticker")
 
-    if financials is None:
-        financials = tk.financials
-    if cashflow is None:
-        cashflow = tk.cashflow
-    if balance is None:
-        balance = tk.balance_sheet
+    financials = tk.financials
+    cashflow = tk.cashflow
+    balance = tk.balance_sheet
 
     missing_sections = []
     for name, frame in (
@@ -768,7 +677,7 @@ async def get_company(request: Request, ticker: str):
             missing_sections.append(name)
 
     if missing_sections:
-        fallback_frames = _fetch_financials_via_quote_summary(ticker_clean, tk)
+        fallback_frames = _fetch_financials_via_quote_summary(ticker, tk)
         if fallback_frames:
             if (financials is None or financials.empty) and not fallback_frames["financials"].empty:
                 financials = fallback_frames["financials"]
@@ -788,8 +697,6 @@ async def get_company(request: Request, ticker: str):
     if missing_sections:
         logger.warning("Ticker %s missing sections after fallback: %s", ticker, ",".join(missing_sections))
         raise HTTPException(status_code=502, detail="Upstream data unavailable. Please retry later.")
-    if cached_frames is None:
-        _cache_statements(ticker_clean, financials, cashflow, balance)
 
     revenue_series = get_row(financials, "Total Revenue")
     ebit_series = get_ebit_series(financials)
@@ -1073,7 +980,7 @@ async def get_company(request: Request, ticker: str):
                 }
 
     return {
-        "ticker": ticker_clean,
+        "ticker": ticker.upper(),
         "baseYear": base_year,
         "derived": derived,
         "fcfSeries": fcf_list,
