@@ -54,10 +54,7 @@ def _build_yf_session():
     session_cls = curl_requests.Session if curl_requests is not None else requests.Session
     session = session_cls()
     session.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+        {"User-Agent": "Mozilla/5.0"}
     )
     if session_cls is requests.Session:
         retry = Retry(
