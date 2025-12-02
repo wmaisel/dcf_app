@@ -48,15 +48,22 @@ def _cache_enabled() -> bool:
     return True
 
 
+_DEFAULT_YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
 def _build_yf_session():
     # Use curl_cffi by default because Yahoo now requires it. Only fall back to
     # requests.Session when curl_cffi isn't available (tests, minimal envs).
-    session_cls = curl_requests.Session if curl_requests is not None else requests.Session
-    session = session_cls()
-    session.headers.update(
-        {"User-Agent": "Mozilla/5.0"}
-    )
-    if session_cls is requests.Session:
+    if curl_requests is not None:
+        session = curl_requests.Session(impersonate="chrome")
+        session.headers.update(_DEFAULT_YF_HEADERS)
+    else:
+        session = requests.Session()
+        session.headers.update(_DEFAULT_YF_HEADERS)
         retry = Retry(
             total=3,
             backoff_factor=0.5,
