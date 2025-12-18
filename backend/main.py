@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+import threading
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +31,11 @@ FUND_CACHE_TTL = int(os.environ.get("FUNDAMENTALS_CACHE_TTL", "900"))
 ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
 ALPHAVANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 _FUNDAMENTALS_CACHE: Dict[str, Dict[str, pd.DataFrame]] = {}
+_MARKET_CACHE: Dict[str, Dict[str, Any]] = {}
+_MARKET_CACHE_TTL = int(os.environ.get("MARKET_CACHE_TTL", "300"))
+_AV_RATE_LOCK = threading.Lock()
+_AV_LAST_CALL_TS = 0.0
+_AV_MIN_INTERVAL_SEC = float(os.environ.get("ALPHAVANTAGE_MIN_INTERVAL", "1.3"))
 
 
 def _cache_enabled() -> bool:
@@ -53,6 +59,15 @@ def _fetch_alpha_json(params: Dict[str, str]) -> Dict[str, Any]:
 
     merged = dict(params)
     merged["apikey"] = ALPHAVANTAGE_API_KEY
+    # Enforce a minimum interval between Alpha Vantage calls to avoid 429s.
+    global _AV_LAST_CALL_TS
+    with _AV_RATE_LOCK:
+        now = time.time()
+        elapsed = now - _AV_LAST_CALL_TS
+        wait = _AV_MIN_INTERVAL_SEC - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _AV_LAST_CALL_TS = time.time()
     try:
         response = requests.get(ALPHAVANTAGE_BASE_URL, params=merged, timeout=20)
         response.raise_for_status()
@@ -68,6 +83,7 @@ def _fetch_alpha_json(params: Dict[str, str]) -> Dict[str, Any]:
         raise HTTPException(status_code=429, detail="Alpha Vantage rate limit hit. Please retry.")
     if isinstance(payload, dict) and payload.get("Information"):
         logger.warning("Alpha Vantage informational response: %s", payload.get("Information"))
+        raise HTTPException(status_code=429, detail="Alpha Vantage rate limit hit. Please retry.")
     return payload
 
 
@@ -142,14 +158,25 @@ def _fetch_alpha_statements(ticker: str) -> Dict[str, pd.DataFrame]:
 
 
 def _fetch_alpha_overview(ticker: str) -> Dict[str, Any]:
-    return _fetch_alpha_json({"function": "OVERVIEW", "symbol": ticker}) or {}
+    cached = _MARKET_CACHE.get(f"overview:{ticker}")
+    if cached and (time.time() - cached.get("ts", 0)) < _MARKET_CACHE_TTL:
+        return cached["data"]
+    data = _fetch_alpha_json({"function": "OVERVIEW", "symbol": ticker}) or {}
+    _MARKET_CACHE[f"overview:{ticker}"] = {"data": data, "ts": time.time()}
+    return data
 
 
 def _fetch_alpha_quote(ticker: str) -> Dict[str, Any]:
+    cached = _MARKET_CACHE.get(f"quote:{ticker}")
+    if cached and (time.time() - cached.get("ts", 0)) < _MARKET_CACHE_TTL:
+        return cached["data"]
     payload = _fetch_alpha_json({"function": "GLOBAL_QUOTE", "symbol": ticker})
     if not isinstance(payload, dict):
-        return {}
-    return payload.get("Global Quote") or {}
+        data = {}
+    else:
+        data = payload.get("Global Quote") or {}
+    _MARKET_CACHE[f"quote:{ticker}"] = {"data": data, "ts": time.time()}
+    return data
 
 
 _TICKER_RE = re.compile(r"^[A-Z0-9\.\-]+$")
@@ -689,8 +716,8 @@ async def get_company(request: Request, ticker: str):
             missing_sections.append(name)
 
     if missing_sections:
-        logger.warning("Ticker %s missing sections after fallback: %s", ticker_clean, ",".join(missing_sections))
-        raise HTTPException(status_code=502, detail="Upstream data unavailable. Please retry later.")
+        logger.warning("Ticker %s missing Alpha Vantage sections: %s", ticker_clean, ",".join(missing_sections))
+        raise HTTPException(status_code=429, detail="Alpha Vantage rate limit or data unavailable. Please retry.")
     if cached_frames is None:
         _cache_statements(
             ticker_clean,

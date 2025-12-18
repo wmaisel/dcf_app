@@ -21,6 +21,8 @@ Hosted on Render:
   - `ALPHAVANTAGE_API_KEY` (required)
   - `ALLOWED_ORIGINS` (comma-separated; include your frontend origin)
   - `FUNDAMENTALS_CACHE_TTL` (optional, seconds; default 900)
+  - `ALPHAVANTAGE_MIN_INTERVAL` (optional, seconds between AV calls; default 1.3)
+  - `MARKET_CACHE_TTL` (optional, seconds to cache quote/overview; default 300)
 - Start command: `uvicorn backend.main:app --host 0.0.0.0 --port 10000`
 - Port: 10000 (Render default for FastAPI)
 
