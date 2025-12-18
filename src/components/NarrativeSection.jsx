@@ -172,7 +172,7 @@ export function NarrativeSection({ dcfResult, inputs, derived, insights }) {
       title: 'Company Fundamentals',
       numbers: fundamentalsNumbers,
       equations: [
-        'Raw historical values pulled from yfinance via the backend; no adjustments applied at this stage.',
+        'Raw historical values pulled from Alpha Vantage via the backend; no adjustments applied at this stage.',
         'These metrics anchor scale (revenue), profitability (EBIT margin), and capital structure (shares, net debt).',
       ],
       output: 'Raw scale, profitability, and leverage inputs that seed the normalization step.',

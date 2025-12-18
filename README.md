@@ -1,17 +1,19 @@
 # DCF App (Alpha Vantage backend on Render)
 
-React/Vite frontend plus FastAPI backend. Hosted deployments use Alpha Vantage; local runs can still work without a key via yfinance.
+React/Vite frontend plus FastAPI backend. All deployments use Alpha Vantage for fundamentals.
 
 ## Prerequisites
 - Python 3.10+
 - Node.js 18+ (with npm)
 
 ## Backend (FastAPI)
-Local (no API key needed):
+Local (requires Alpha Vantage API key):
 ```bash
 python3 -m venv venv
 source venv/bin/activate  # on Windows: venv\Scripts\activate
 pip install -r requirements.txt
+# set your Alpha Vantage key in the environment before running
+export ALPHAVANTAGE_API_KEY=your_key_here
 uvicorn backend.main:app --reload --port 8000
 ```
 Hosted on Render:
