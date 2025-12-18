@@ -35,6 +35,8 @@ from .dcf_engine_v2 import run_dcf_v2, DCFComputationError, ScenarioPreset
 logger = logging.getLogger(__name__)
 
 FUND_CACHE_TTL = int(os.environ.get("FUNDAMENTALS_CACHE_TTL", "900"))
+ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
+ALPHAVANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 _FUNDAMENTALS_CACHE: Dict[str, Dict[str, pd.DataFrame]] = {}
 
 
@@ -73,6 +75,7 @@ def _build_yf_session():
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
+    _refresh_yf_crumb(session)
     return session
 
 
@@ -89,6 +92,138 @@ def _get_yf_ticker(ticker: str) -> yf.Ticker:
     except Exception as exc:
         logger.warning("Custom session rejected for %s: %s; falling back to default session", ticker, exc)
         return yf.Ticker(ticker)
+
+
+def _refresh_yf_crumb(session) -> None:
+    """
+    Proactively hit the crumb endpoint so Yahoo sets the cookie before
+    financials calls. Helps avoid intermittent "Invalid Crumb" 401s locally.
+    """
+    try:
+        session.get("https://fc.yahoo.com", timeout=10)
+    except Exception as exc:
+        logger.debug("Crumb refresh failed: %s", exc)
+
+
+def _fetch_statements_via_ticker(tk: yf.Ticker) -> Dict[str, Optional[pd.DataFrame]]:
+    frames = {"financials": None, "cashflow": None, "balance": None}
+    for key, attr in (("financials", "financials"), ("cashflow", "cashflow"), ("balance", "balance_sheet")):
+        try:
+            frames[key] = getattr(tk, attr)
+        except Exception as exc:
+            logger.warning("yfinance %s fetch failed: %s", attr, exc)
+            frames[key] = None
+    return frames
+
+
+# ----------------------------
+# Alpha Vantage client helpers
+# ----------------------------
+
+
+def _fetch_alpha_json(params: Dict[str, str]) -> Dict[str, Any]:
+    if not ALPHAVANTAGE_API_KEY:
+        raise HTTPException(status_code=500, detail="Alpha Vantage API key not configured")
+
+    merged = dict(params)
+    merged["apikey"] = ALPHAVANTAGE_API_KEY
+    try:
+        response = requests.get(ALPHAVANTAGE_BASE_URL, params=merged, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Alpha Vantage request failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Alpha Vantage upstream error")
+
+    if isinstance(payload, dict) and payload.get("Note"):
+        # Rate-limited or quota exceeded
+        raise HTTPException(status_code=429, detail="Alpha Vantage rate limit hit. Please retry.")
+    if isinstance(payload, dict) and payload.get("Information"):
+        logger.warning("Alpha Vantage informational response: %s", payload.get("Information"))
+    return payload
+
+
+def _av_statement_to_df(raw_list: Optional[List[Dict[str, Any]]], mapping: Dict[str, str]) -> pd.DataFrame:
+    """
+    Convert Alpha Vantage statement list to a DataFrame with human-readable row labels.
+    """
+    if not raw_list:
+        return pd.DataFrame()
+
+    rows: Dict[str, Dict[pd.Timestamp, float]] = {}
+    for entry in raw_list:
+        if not isinstance(entry, dict):
+            continue
+        date_str = entry.get("fiscalDateEnding")
+        try:
+            col = pd.to_datetime(date_str, utc=True)
+        except Exception:
+            continue
+        for raw_key, label in mapping.items():
+            if raw_key not in entry:
+                continue
+            value = entry.get(raw_key)
+            try:
+                num = float(value)
+            except Exception:
+                continue
+            rows.setdefault(label, {})[col] = num
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    df = df[sorted(df.columns, reverse=True)]
+    return df
+
+
+def _fetch_alpha_statements(ticker: str) -> Dict[str, pd.DataFrame]:
+    income_payload = _fetch_alpha_json({"function": "INCOME_STATEMENT", "symbol": ticker})
+    balance_payload = _fetch_alpha_json({"function": "BALANCE_SHEET", "symbol": ticker})
+    cash_payload = _fetch_alpha_json({"function": "CASH_FLOW", "symbol": ticker})
+
+    income_map = {
+        "totalRevenue": "Total Revenue",
+        "grossProfit": "Gross Profit",
+        "researchAndDevelopment": "Research Development",
+        "sellingGeneralAndAdministrative": "Selling General Administrative",
+        "operatingIncome": "Operating Income",
+        "ebit": "Ebit",
+        "incomeBeforeTax": "Income Before Tax",
+        "incomeTaxExpense": "Income Tax Expense",
+        "interestAndDebtExpense": "Interest Expense",
+    }
+    balance_map = {
+        "totalCurrentAssets": "Total Current Assets",
+        "totalCurrentLiabilities": "Total Current Liabilities",
+        "cashAndCashEquivalentsAtCarryingValue": "Cash",
+        "cashAndShortTermInvestments": "Cash",
+        "shortLongTermDebtTotal": "Short Long Term Debt",
+        "longTermDebtNoncurrent": "Long Term Debt",
+    }
+    cash_map = {
+        "operatingCashflow": "Operating Cash Flow",
+        "capitalExpenditures": "Capital Expenditures",
+        "changeInInventory": "Change In Inventory",
+        "changeInReceivables": "Change In Receivables",
+    }
+
+    financials = _av_statement_to_df(income_payload.get("annualReports"), income_map)
+    balance = _av_statement_to_df(balance_payload.get("annualReports"), balance_map)
+    cashflow = _av_statement_to_df(cash_payload.get("annualReports"), cash_map)
+
+    return {"financials": financials, "cashflow": cashflow, "balance": balance}
+
+
+def _fetch_alpha_overview(ticker: str) -> Dict[str, Any]:
+    return _fetch_alpha_json({"function": "OVERVIEW", "symbol": ticker}) or {}
+
+
+def _fetch_alpha_quote(ticker: str) -> Dict[str, Any]:
+    payload = _fetch_alpha_json({"function": "GLOBAL_QUOTE", "symbol": ticker})
+    if not isinstance(payload, dict):
+        return {}
+    return payload.get("Global Quote") or {}
 
 
 _TICKER_RE = re.compile(r"^[A-Z0-9\.\-]+$")
@@ -727,17 +862,16 @@ async def get_company(request: Request, ticker: str):
     cashflow = cached_frames.get("cashflow") if cached_frames else None
     balance = cached_frames.get("balance") if cached_frames else None
 
-    try:
-        tk = _get_yf_ticker(ticker_clean)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid ticker")
-
-    if financials is None:
-        financials = tk.financials
-    if cashflow is None:
-        cashflow = tk.cashflow
-    if balance is None:
-        balance = tk.balance_sheet
+    # Fetch via Alpha Vantage if cache is missing
+    if financials is None or cashflow is None or balance is None:
+        frames = _fetch_alpha_statements(ticker_clean)
+        financials = financials or frames["financials"]
+        cashflow = cashflow or frames["cashflow"]
+        balance = balance or frames["balance"]
+        # Add alias rows to match yfinance labels where needed
+        if cashflow is not None and not cashflow.empty:
+            if "Operating Cash Flow" in cashflow.index and "Total Cash From Operating Activities" not in cashflow.index:
+                cashflow.loc["Total Cash From Operating Activities"] = cashflow.loc["Operating Cash Flow"]
 
     missing_sections = []
     for name, frame in (
@@ -747,24 +881,6 @@ async def get_company(request: Request, ticker: str):
     ):
         if frame is None or frame.empty:
             missing_sections.append(name)
-
-    if missing_sections:
-        fallback_frames = _fetch_financials_via_quote_summary(ticker_clean, tk)
-        if fallback_frames:
-            if (financials is None or financials.empty) and not fallback_frames["financials"].empty:
-                financials = fallback_frames["financials"]
-            if (cashflow is None or cashflow.empty) and not fallback_frames["cashflow"].empty:
-                cashflow = fallback_frames["cashflow"]
-            if (balance is None or balance.empty) and not fallback_frames["balance"].empty:
-                balance = fallback_frames["balance"]
-        missing_sections = []
-        for name, frame in (
-            ("financials", financials),
-            ("cashflow", cashflow),
-            ("balance_sheet", balance),
-        ):
-            if frame is None or frame.empty:
-                missing_sections.append(name)
 
     if missing_sections:
         logger.warning("Ticker %s missing sections after fallback: %s", ticker_clean, ",".join(missing_sections))
@@ -847,15 +963,24 @@ async def get_company(request: Request, ticker: str):
         fallback_rate=tax_rate if tax_rate is not None else 0.21,
     )
 
-    info = getattr(tk, "fast_info", {}) or {}
-    legacy_info = getattr(tk, "info", {}) or {}
+    overview = _fetch_alpha_overview(ticker_clean)
+    quote = _fetch_alpha_quote(ticker_clean)
 
-    market_cap = float(info.get("market_cap") or legacy_info.get("marketCap") or 0.0)
-    if not math.isfinite(market_cap) or market_cap < 0:
-        market_cap = 0.0
-    shares_outstanding = float(info.get("shares_outstanding") or legacy_info.get("sharesOutstanding") or 0.0)
-    beta_raw = legacy_info.get("beta") or info.get("beta")
-    beta_raw = float(beta_raw) if beta_raw is not None else 1.0
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            num = float(value)
+            if not math.isfinite(num):
+                return default
+            return num
+        except Exception:
+            return default
+
+    market_cap = _safe_float(overview.get("MarketCapitalization"), 0.0)
+    shares_outstanding = _safe_float(overview.get("SharesOutstanding"), 0.0)
+    beta_raw = _safe_float(overview.get("Beta"), 1.0)
+    price_quote = _safe_float(quote.get("05. price") or quote.get("05. Price"), 0.0)
+    if market_cap == 0.0 and shares_outstanding > 0 and price_quote > 0:
+        market_cap = shares_outstanding * price_quote
 
     short_debt_series = get_row(balance, "Short Long Term Debt")
     long_debt_series = get_row(balance, "Long Term Debt")

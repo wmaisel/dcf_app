@@ -1,16 +1,37 @@
-# React + Vite
+# DCF App (Alpha Vantage backend on Render)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React/Vite frontend plus FastAPI backend. Hosted deployments use Alpha Vantage; local runs can still work without a key via yfinance.
 
-Currently, two official plugins are available:
+## Prerequisites
+- Python 3.10+
+- Node.js 18+ (with npm)
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## Backend (FastAPI)
+Local (no API key needed):
+```bash
+python3 -m venv venv
+source venv/bin/activate  # on Windows: venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn backend.main:app --reload --port 8000
+```
+Hosted on Render:
+- Set environment variables:
+  - `ALPHAVANTAGE_API_KEY` (required)
+  - `ALLOWED_ORIGINS` (comma-separated; include your frontend origin)
+  - `FUNDAMENTALS_CACHE_TTL` (optional, seconds; default 900)
+- Start command: `uvicorn backend.main:app --host 0.0.0.0 --port 10000`
+- Port: 10000 (Render default for FastAPI)
 
-## React Compiler
+## Frontend (Vite/React)
+```bash
+npm install
+# Set the backend URL (Render)
+echo "VITE_API_BASE=https://<your-render-backend-url>" > .env.local
+npm run dev
+```
+For local backend, use `VITE_API_BASE=http://localhost:8000` or rely on the default.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## End-to-end check
+1) Backend running (local or Render).  
+2) Frontend running (`npm run dev`) with `VITE_API_BASE` pointed correctly.  
+3) In the app, enter `AAPL`, click “Load Fundamentals”, then “Run Valuation”. You should see fundamentals/DCF outputs and no CORS or 401 errors in the browser console.
